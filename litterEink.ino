@@ -27,6 +27,7 @@
 #include <time.h>
 #include <ctype.h>
 #include <SensorPCF8563.hpp>
+#include "esp_adc_cal.h"
 
 #include "epd_driver.h"
 #include "utilities.h"
@@ -51,14 +52,8 @@
 #define SENSOR_SCL       17
 #define SENSOR_IRQ       9
 
-// Alarm fires daily at this hour (24-h format).
-#define ALARM_HOUR   18
-#define ALARM_MINUTE 00
-
 // Sync NTP every N alarm wakeups. Set to 1 to sync every time.
 #define NTP_SYNC_INTERVAL 30
-
-const bool DISABLE_DEEP_SLEEP = false;
 
 const char *ntpServer1 = "pool.ntp.org";
 const char *ntpServer2 = "time.nist.gov";
@@ -69,12 +64,14 @@ const char *time_zone  = "PST8PDT,M3.2.0,M11.1.0";
 RTC_DATA_ATTR uint32_t alarmWakeCount = 0;
 RTC_DATA_ATTR bool     rtcInitialised = false;  // has NTP ever been synced?
 RTC_DATA_ATTR bool     rtcCleanTimestampValid = false;
+RTC_DATA_ATTR bool     rtcReminderOverdue = false;
 RTC_DATA_ATTR struct tm rtcLastCleanTimeInfo = {0};
 
 // ── Globals ────────────────────────────────────────────────────────────────
 uint8_t *framebuffer = nullptr;
 SensorPCF8563 rtc;
 bool timeSynced = false;
+int vref = 1100;
 
 enum DisplayMode { DISPLAY_DIRTY, DISPLAY_CLEAN };
 DisplayMode currentMode = DISPLAY_DIRTY;
@@ -98,6 +95,12 @@ void timeavailable(struct timeval *t)
 {
     Serial.println("[NTP] Got time adjustment");
     timeSynced = true;
+}
+
+void configureLocalTimezone()
+{
+    setenv("TZ", time_zone, 1);
+    tzset();
 }
 
 void syncTimeFromNTP()
@@ -191,16 +194,87 @@ void logRTCTime()
                   now.getHour(), now.getMinute(), now.getSecond());
 }
 
-void setDailyAlarm()
+bool setReminderAlarm24HoursAfter(const struct tm *baseTime)
 {
+    if (!baseTime) {
+        return false;
+    }
+
+    struct tm target = *baseTime;
+    target.tm_isdst = -1;
+
+    time_t targetEpoch = mktime(&target);
+    if (targetEpoch == (time_t)-1) {
+        Serial.println("Failed to convert reminder base time.");
+        return false;
+    }
+
+    targetEpoch += 24 * 60 * 60;
+    localtime_r(&targetEpoch, &target);
+
     // Clear any previous alarm state.
     rtc.resetAlarm();
     rtc.disableAlarm();
+    rtc.clearCountdownTimer();
 
-    // PCF8563 alarm: hour, minute, day-of-month (0xFF = any), weekday (0xFF = any)
-    rtc.setAlarm(ALARM_HOUR, ALARM_MINUTE, 0xFF, 0xFF);
+    // PCF8563 alarm fields are minute, hour, day-of-month, weekday.
+    rtc.setAlarm(target.tm_hour, target.tm_min, target.tm_mday, 0xFF);
     rtc.enableAlarm();
-    Serial.printf("RTC alarm set for %02d:%02d daily\n", ALARM_HOUR, ALARM_MINUTE);
+
+    Serial.printf("RTC reminder set for %04d-%02d-%02d %02d:%02d\n",
+                  target.tm_year + 1900, target.tm_mon + 1, target.tm_mday,
+                  target.tm_hour, target.tm_min);
+    return true;
+}
+
+bool setReminderAlarm24HoursFromNow()
+{
+    struct tm now;
+    if (!getRTCLocalTime(&now)) {
+        Serial.println("Failed to read RTC time for reminder scheduling.");
+        return false;
+    }
+
+    return setReminderAlarm24HoursAfter(&now);
+}
+
+float readBatteryVoltage()
+{
+    uint16_t v = analogRead(BATT_PIN);
+    float battery_voltage = ((float)v / 4095.0) * 2.0 * 3.3 * (vref / 1000.0);
+    if (battery_voltage >= 4.2) {
+        battery_voltage = 4.2;
+    }
+    return battery_voltage;
+}
+
+void drawTopRightBatteryWarning()
+{
+    // Define low battery threshold (e.g., 3.4V)
+    const float LOW_BATTERY_THRESHOLD = 3.6;
+    
+    float voltage = readBatteryVoltage();
+    
+    if (voltage >= LOW_BATTERY_THRESHOLD) return;
+
+    char warningText[32];
+    snprintf(warningText, sizeof(warningText), "low battery (%.1fv)", voltage);
+    
+    GFXfont *font = (GFXfont *)&OpenSans12B;
+
+    FontProperties props = {
+        .fg_color = 0,
+        .bg_color = 15,
+        .fallback_glyph = 0,
+        .flags = 0
+    };
+
+    const int x = EPD_WIDTH - 200;
+    const int y = 44;
+
+    int drawX = x;
+    int drawY = y;
+    write_mode(font, warningText, &drawX, &drawY, framebuffer, BLACK_ON_WHITE, &props);
 }
 
 // ── Display helpers (unchanged from original) ──────────────────────────────
@@ -238,13 +312,18 @@ void formatCleanStampStrings(
     char *line1, size_t line1Size,
     char *line2, size_t line2Size,
     char *line3, size_t line3Size,
-    const struct tm *timeinfo)
+    const struct tm *timeinfo,
+    bool showReminderMarker)
 {
     int hour12 = timeinfo->tm_hour % 12;
     if (hour12 == 0) hour12 = 12;
     const char *ampm = (timeinfo->tm_hour >= 12) ? "pm" : "am";
 
-    snprintf(line1, line1Size, "last cleaned");
+    if (showReminderMarker) {
+        snprintf(line1, line1Size, "last cleaned !");
+    } else {
+        snprintf(line1, line1Size, "last cleaned");
+    }
     snprintf(line2, line2Size, "%d:%02d%s", hour12, timeinfo->tm_min, ampm);
     snprintf(line3, line3Size, "%s %d/%d",
              getWeekdayShort(timeinfo->tm_wday),
@@ -256,12 +335,15 @@ void drawTopLeftCleanStamp()
 {
     if (!rtcCleanTimestampValid) return;
 
+    bool showReminder = (currentMode == DISPLAY_DIRTY && rtcReminderOverdue);
+
     char labelLine[40], timeLine[40], dateLine[24];
     formatCleanStampStrings(
         labelLine, sizeof(labelLine),
         timeLine, sizeof(timeLine),
         dateLine, sizeof(dateLine),
-        &rtcLastCleanTimeInfo
+        &rtcLastCleanTimeInfo,
+        showReminder
     );
 
     FontProperties props = {
@@ -306,9 +388,11 @@ void copySelectedImageToFramebuffer()
     if (currentMode == DISPLAY_DIRTY) {
         epd_copy_to_framebuffer(area, (uint8_t *)dirty_image_data, framebuffer);
         drawTopLeftCleanStamp();
+        drawTopRightBatteryWarning();
     } else {
         epd_copy_to_framebuffer(area, (uint8_t *)clean_image_data, framebuffer);
         drawTopLeftCleanStamp();
+        drawTopRightBatteryWarning();
     }
 }
 
@@ -372,7 +456,7 @@ WakeReason determineWakeReason()
 // ── Deep sleep ─────────────────────────────────────────────────────────────
 void enterDeepSleep()
 {
-    if (DISABLE_DEEP_SLEEP) return;
+    // if (DISABLE_DEEP_SLEEP) return;
 
     // Configure ext1 wake on ANY_LOW for both pins.
     uint64_t mask = (1ULL << CLEAN_BUTTON_PIN) | (1ULL << CLEAN_BUTTON_PIN_2) | (1ULL << SENSOR_IRQ);
@@ -405,6 +489,8 @@ void setup()
     Serial.begin(115200);
     delay(200);
 
+    configureLocalTimezone();
+
     // De-init RTC IOs that may have been held during sleep.
     rtc_gpio_deinit((gpio_num_t)CLEAN_BUTTON_PIN);
     rtc_gpio_deinit((gpio_num_t)CLEAN_BUTTON_PIN_2);
@@ -423,6 +509,20 @@ void setup()
         while (1) delay(1000);
     }
     memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+
+    // ── Calibrate ADC for battery voltage reading ─────────────────────────
+    esp_adc_cal_characteristics_t adc_chars;
+    esp_adc_cal_value_t val_type = esp_adc_cal_characterize(
+        ADC_UNIT_1,
+        ADC_ATTEN_DB_11,
+        ADC_WIDTH_BIT_12,
+        1100,
+        &adc_chars
+    );
+    if (val_type == ESP_ADC_CAL_VAL_EFUSE_VREF) {
+        Serial.printf("eFuse Vref: %umV\r\n", adc_chars.vref);
+        vref = adc_chars.vref;
+    }
 
     esp_reset_reason_t resetReason = esp_reset_reason();
     Serial.printf("esp_reset_reason: %d\n", (int)resetReason);
@@ -447,7 +547,13 @@ void setup()
     case WAKE_BUTTON:
         Serial.println("Woke from BUTTON press (GPIO15)");
         // Button press = "just cleaned". Read time from external RTC (no WiFi).
+        rtcReminderOverdue = false;
         showCleanNow();
+        if (rtcCleanTimestampValid) {
+            setReminderAlarm24HoursAfter(&rtcLastCleanTimeInfo);
+        } else {
+            setReminderAlarm24HoursFromNow();
+        }
         break;
 
     case WAKE_RTC_ALARM:
@@ -463,6 +569,9 @@ void setup()
         }
 
         showDirtyNow();
+        setReminderAlarm24HoursFromNow();
+        // set reminder overdue after rendering from wake from alarm, this way if another alarm hits we'll get the exclamation mark
+        rtcReminderOverdue = true;
         break;
 
     case WAKE_COLD_BOOT:
@@ -471,17 +580,13 @@ void setup()
         // First boot ever – must sync NTP to seed the external RTC.
         syncTimeFromNTP();
         alarmWakeCount = 0;
+        rtcReminderOverdue = false;
+        rtc.disableAlarm();
         showDirtyNow();
         break;
     }
 
     logRTCTime();
-
-    // Only set the alarm on first boot; it persists across sleeps.
-    // resetAlarm() at the top of setup() clears the flag each wake.
-    if (reason == WAKE_COLD_BOOT) {
-        setDailyAlarm();
-    }
 
     delay(50);
     enterDeepSleep();
