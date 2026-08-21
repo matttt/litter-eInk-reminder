@@ -1,5 +1,11 @@
 # litterEink
 
+
+
+https://github.com/user-attachments/assets/5ce3907d-8147-40a7-92b5-2e27a177cc9c
+
+
+
 Firmware for the LILYGO T5 4.7-inch e-paper V2.3 (`T5-ePaper-S3`). It displays
 the litter-box state, records the last cleaning time in the onboard PCF8563
 RTC, schedules a reminder alarm, keeps a seven-day cleaner history on screen,
