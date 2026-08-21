@@ -320,9 +320,9 @@ void formatCleanStampStrings(
     const char *ampm = (timeinfo->tm_hour >= 12) ? "pm" : "am";
 
     if (showReminderMarker) {
-        snprintf(line1, line1Size, "last cleaned !");
+        snprintf(line1, line1Size, "last scooped !");
     } else {
-        snprintf(line1, line1Size, "last cleaned");
+        snprintf(line1, line1Size, "last scooped");
     }
     snprintf(line2, line2Size, "%d:%02d%s", hour12, timeinfo->tm_min, ampm);
     snprintf(line3, line3Size, "%s %d/%d",
@@ -381,8 +381,12 @@ void copySelectedImageToFramebuffer()
     Rect_t area = {
         .x = 0,
         .y = 0,
-        .width  = (currentMode == DISPLAY_DIRTY) ? dirty_image_width : clean_image_width,
-        .height = (currentMode == DISPLAY_DIRTY) ? dirty_image_height : clean_image_height
+        .width  = static_cast<int32_t>(
+            (currentMode == DISPLAY_DIRTY) ? dirty_image_width : clean_image_width
+        ),
+        .height = static_cast<int32_t>(
+            (currentMode == DISPLAY_DIRTY) ? dirty_image_height : clean_image_height
+        )
     };
 
     if (currentMode == DISPLAY_DIRTY) {
@@ -514,7 +518,7 @@ void setup()
     esp_adc_cal_characteristics_t adc_chars;
     esp_adc_cal_value_t val_type = esp_adc_cal_characterize(
         ADC_UNIT_1,
-        ADC_ATTEN_DB_11,
+        ADC_ATTEN_DB_12,
         ADC_WIDTH_BIT_12,
         1100,
         &adc_chars
