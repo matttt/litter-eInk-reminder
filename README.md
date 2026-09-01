@@ -7,9 +7,9 @@ https://github.com/user-attachments/assets/5ce3907d-8147-40a7-92b5-2e27a177cc9c
 
 
 Firmware for the LILYGO T5 4.7-inch e-paper V2.3 (`T5-ePaper-S3`). It displays
-the litter-box state, records the last cleaning time in the onboard PCF8563
-RTC, schedules a reminder alarm, keeps a seven-day cleaner history on screen,
-logs cleaning events to the onboard SD card, and spends the rest of its time in
+the litter-box state, records the last cleaning time, keeps a seven-day cleaner
+history in ESP32 RTC memory, schedules midnight refreshes and a 24-hour cleaning
+reminder through the onboard PCF8563 RTC, and spends the rest of its time in
 deep sleep.
 
 ## PlatformIO
@@ -26,8 +26,8 @@ The firmware source is split by responsibility:
 | Module | Responsibility |
 | --- | --- |
 | `main.cpp` | Wake handling, deep-sleep state, and application flow |
-| `clock_service.*` | PCF8563 RTC, NTP sync, and reminder alarms |
-| `cleaning_history.*` | Cleaner identities, SD-card CSV storage, and seven-day summaries |
+| `clock_service.*` | PCF8563 RTC, NTP sync, and midnight/reminder scheduling |
+| `cleaning_history.*` | Cleaner identities and the RTC-backed seven-day history |
 | `display_ui.*` | E-paper rendering, cleaner history panel, and battery warning |
 | `app_config.h` | Pins, network settings, time zone, and application constants |
 
@@ -64,12 +64,8 @@ run the firmware.
 | Matthew clean button / built-in user button | 21 |
 | Programming-mode button / e-paper CFG_STR | 0 |
 | Battery ADC | 14 |
-| SD MISO / MOSI / SCLK / CS | 16 / 15 / 11 / 42 |
 
-Both clean buttons are active-low. GPIO 15 is shared with the onboard SD card's
-MOSI line: the firmware uses it as a wake input during deep sleep, waits for the
-Oriana button to be released, then temporarily assigns it to the SD card. Do not
-hold the Oriana button down while the device is awake.
+Both clean buttons are active-low.
 
 Hold GPIO 0 while the firmware is preparing to sleep to enter programming
 mode. The input must remain low for 100 ms; reset/boot transients are ignored.
@@ -78,27 +74,27 @@ the button and upload new firmware. GPIO 0 is shared with the e-paper
 controller, so the firmware returns it to input mode after each display update
 before reading the button.
 
-Each cleaning is appended to `/cleanings.csv` on the SD card. The file is
-created with this schema:
+The right side of the display shows `Today` and the previous six calendar days.
+At midnight the rows advance, the previous `Today` row receives its weekday
+label, and a blank `Today` row appears at the top. `M` means Matthew, `O` means
+Oriana, and `MO` means both people recorded a cleaning that day.
 
-```csv
-timestamp,who
-2026-08-20T18:15:00-0700,Oriana
-```
+This seven-day window lives only in ESP32 RTC slow memory. It survives deep
+sleep, but a power loss or cold reset starts a fresh window; no cleaning events
+are written to persistent storage.
 
-All-time totals are cached in `/cleanings.tally`:
+The PCF8563 exposes one calendar alarm, so the firmware keeps two logical
+deadlines: the next local midnight and, after a cleaning, its 24-hour reminder.
+It arms whichever comes first, handles every event due at that wake, then arms
+the next deadline. This lets midnight refresh the history without prematurely
+changing a clean display to dirty. The hardware clock and alarm run in UTC;
+local-time conversion happens in firmware so daylight-saving transitions do
+not shift either deadline.
 
-```csv
-oriana,matthew,csv_size
-210,311,24387
-```
+After upgrading from the older local-time RTC firmware, let the first NTP sync
+succeed so the PCF8563 is rewritten in UTC. If that sync fails, the old value
+can appear offset until a later sync succeeds.
 
-The CSV size validates the cache. If the CSV changes without a matching tally
-update, the firmware rebuilds the tally once from the complete log. Normal
-wakeups read the tally and scan backward only through the recent CSV rows
-needed for the seven-day display.
-
-The right side of the display shows today and the previous six calendar days.
-`M` means Matthew, `O` means Oriana, and `MO` means both people recorded a
-cleaning that day. The all-time cleaning pie chart appears in the lower-left
-only on the first day of each month.
+If the external clock reports an invalid time and NTP is unavailable, the
+ESP32 adds an independent one-hour recovery wake instead of sleeping forever
+without a calendar alarm. Cleaner-button wakes remain active during recovery.

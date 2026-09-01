@@ -8,7 +8,6 @@ struct State {
     bool lastCleanTimestampValid;
     struct tm lastCleanTime;
     bool reminderOverdue;
-    bool showAllTimePieChart;
 };
 
 bool initialise();

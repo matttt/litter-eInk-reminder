@@ -1,330 +1,228 @@
 #include "cleaning_history.h"
 
 #include <Arduino.h>
-#include <FS.h>
-#include <SD.h>
-#include <SPI.h>
-#include <ctype.h>
-#include <strings.h>
-
-#include "app_config.h"
-#include "utilities.h"
+#include <string.h>
 
 namespace {
 
+constexpr uint32_t RetainedHistoryMagic = 0x4C484953;  // "LHIS"
+constexpr uint16_t RetainedHistoryVersion = 2;
+constexpr uint32_t ChecksumOffsetBasis = 2166136261U;
+constexpr uint32_t ChecksumPrime = 16777619U;
+
+struct RetainedDay {
+    uint32_t dateKey;
+    uint8_t cleanerMask;
+    uint8_t reserved[3];
+};
+
+struct RetainedHistory {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t dayCount;
+    RetainedDay days[CleaningHistory::DayCount];
+    uint32_t checksum;
+};
+
+// RTC slow memory survives deep-sleep wake cycles but not loss of power.
+RTC_DATA_ATTR RetainedHistory retainedHistory = {};
+
 CleaningHistory::Day history[CleaningHistory::DayCount] = {};
+uint32_t visibleDateKeys[CleaningHistory::DayCount] = {};
 bool historyValid = false;
-CleaningHistory::Totals allTimeTotals = {};
-bool allTimeTotalsValid = false;
 
-uint8_t cleanerMaskFromName(const char *name)
+bool isLeapYear(uint32_t year)
 {
-    using namespace CleaningHistory;
-
-    if (strcasecmp(name, "Oriana") == 0) return Oriana;
-    if (strcasecmp(name, "Matthew") == 0) return Matthew;
-    if (strcasecmp(name, "Oriana+Matthew") == 0 ||
-        strcasecmp(name, "Matthew+Oriana") == 0) {
-        return Both;
-    }
-    return None;
+    return year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
 }
 
-bool initialise(const struct tm *now)
+bool dateKeyIsValid(uint32_t dateKey)
+{
+    uint32_t year = dateKey / 10000;
+    uint32_t month = (dateKey / 100) % 100;
+    uint32_t day = dateKey % 100;
+
+    if (year < 1900 || year > 9999 || month < 1 || month > 12 || day < 1) {
+        return false;
+    }
+
+    static const uint8_t daysPerMonth[] = {
+        31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+    };
+    uint8_t maximumDay = daysPerMonth[month - 1];
+    if (month == 2 && isLeapYear(year)) maximumDay = 29;
+    return day <= maximumDay;
+}
+
+bool dateKeyFromTime(const struct tm *timeInfo, uint32_t *dateKey,
+                     struct tm *normalisedTime = nullptr)
+{
+    if (!timeInfo || !dateKey) return false;
+
+    // Calendar dates are normalised at noon. That keeps date arithmetic clear
+    // of DST transitions, which normally happen in the early morning.
+    struct tm day = *timeInfo;
+    day.tm_hour = 12;
+    day.tm_min = 0;
+    day.tm_sec = 0;
+    day.tm_isdst = -1;
+    if (mktime(&day) == (time_t)-1) return false;
+
+    int year = day.tm_year + 1900;
+    int month = day.tm_mon + 1;
+    int dayOfMonth = day.tm_mday;
+    if (year < 1900 || year > 9999 || month < 1 || month > 12 ||
+        dayOfMonth < 1 || dayOfMonth > 31) {
+        return false;
+    }
+
+    uint32_t key = static_cast<uint32_t>(year * 10000 +
+                                         month * 100 + dayOfMonth);
+    if (!dateKeyIsValid(key)) return false;
+
+    *dateKey = key;
+    if (normalisedTime) *normalisedTime = day;
+    return true;
+}
+
+bool cleanerMaskIsValid(uint8_t cleanerMask)
+{
+    return (cleanerMask & ~static_cast<uint8_t>(CleaningHistory::Both)) == 0;
+}
+
+void addChecksumByte(uint32_t *checksum, uint8_t value)
+{
+    *checksum ^= value;
+    *checksum *= ChecksumPrime;
+}
+
+void addChecksumUint16(uint32_t *checksum, uint16_t value)
+{
+    addChecksumByte(checksum, static_cast<uint8_t>(value));
+    addChecksumByte(checksum, static_cast<uint8_t>(value >> 8));
+}
+
+void addChecksumUint32(uint32_t *checksum, uint32_t value)
+{
+    addChecksumUint16(checksum, static_cast<uint16_t>(value));
+    addChecksumUint16(checksum, static_cast<uint16_t>(value >> 16));
+}
+
+uint32_t retainedHistoryChecksum(const RetainedHistory &record)
+{
+    uint32_t checksum = ChecksumOffsetBasis;
+    addChecksumUint32(&checksum, record.magic);
+    addChecksumUint16(&checksum, record.version);
+    addChecksumUint16(&checksum, record.dayCount);
+
+    for (size_t i = 0; i < CleaningHistory::DayCount; ++i) {
+        const RetainedDay &day = record.days[i];
+        addChecksumUint32(&checksum, day.dateKey);
+        addChecksumByte(&checksum, day.cleanerMask);
+        for (uint8_t value : day.reserved) {
+            addChecksumByte(&checksum, value);
+        }
+    }
+    return checksum;
+}
+
+bool retainedHistoryIsValid()
+{
+    if (retainedHistory.magic != RetainedHistoryMagic ||
+        retainedHistory.version != RetainedHistoryVersion ||
+        retainedHistory.dayCount != CleaningHistory::DayCount ||
+        retainedHistory.checksum !=
+            retainedHistoryChecksum(retainedHistory)) {
+        return false;
+    }
+
+    for (size_t i = 0; i < CleaningHistory::DayCount; ++i) {
+        const RetainedDay &day = retainedHistory.days[i];
+        if (!dateKeyIsValid(day.dateKey) ||
+            !cleanerMaskIsValid(day.cleanerMask)) {
+            return false;
+        }
+
+        for (size_t previous = 0; previous < i; ++previous) {
+            if (retainedHistory.days[previous].dateKey == day.dateKey) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool initialiseVisibleDays(const struct tm *now)
 {
     if (!now) return false;
 
     for (size_t i = 0; i < CleaningHistory::DayCount; ++i) {
         struct tm day = *now;
-        day.tm_hour = 12;
-        day.tm_min = 0;
-        day.tm_sec = 0;
         day.tm_mday -= static_cast<int>(i);
-        day.tm_isdst = -1;
 
-        if (mktime(&day) == (time_t)-1) {
+        if (!dateKeyFromTime(&day, &visibleDateKeys[i], &day)) {
             Serial.println("Failed to calculate cleaning-history date.");
             return false;
         }
 
-        strftime(history[i].date, sizeof(history[i].date), "%Y-%m-%d", &day);
-
-        strftime(history[i].label, sizeof(history[i].label), "%a", &day);
+        if (i == 0) {
+            snprintf(history[i].label, sizeof(history[i].label), "Today");
+        } else if (strftime(history[i].label, sizeof(history[i].label),
+                            "%A", &day) == 0) {
+            return false;
+        }
         history[i].cleanerMask = CleaningHistory::None;
     }
 
     return true;
 }
 
-void addCleaning(const char *date, uint8_t cleanerMask)
+void reconcileRetainedHistory()
+{
+    if (!retainedHistoryIsValid()) {
+        memset(&retainedHistory, 0, sizeof(retainedHistory));
+        return;
+    }
+
+    for (size_t visible = 0; visible < CleaningHistory::DayCount; ++visible) {
+        for (size_t retained = 0; retained < CleaningHistory::DayCount;
+             ++retained) {
+            if (visibleDateKeys[visible] ==
+                retainedHistory.days[retained].dateKey) {
+                history[visible].cleanerMask |=
+                    retainedHistory.days[retained].cleanerMask;
+            }
+        }
+    }
+}
+
+void addCleaning(uint32_t dateKey, uint8_t cleanerMask)
 {
     for (size_t i = 0; i < CleaningHistory::DayCount; ++i) {
-        if (strncmp(history[i].date, date, 10) == 0) {
+        if (visibleDateKeys[i] == dateKey) {
             history[i].cleanerMask |= cleanerMask;
             return;
         }
     }
 }
 
-uint8_t cleanerMaskFromCsvLine(char *line)
+void retainVisibleHistory()
 {
-    size_t length = strlen(line);
-    while (length > 0 && isspace(static_cast<unsigned char>(line[length - 1]))) {
-        line[--length] = '\0';
+    // Build the complete record before copying it into RTC memory. Validation
+    // does not depend on write order: a torn copy will fail its checksum.
+    RetainedHistory fresh = {};
+    fresh.magic = RetainedHistoryMagic;
+    fresh.version = RetainedHistoryVersion;
+    fresh.dayCount =
+        static_cast<uint16_t>(CleaningHistory::DayCount);
+
+    for (size_t i = 0; i < CleaningHistory::DayCount; ++i) {
+        fresh.days[i].dateKey = visibleDateKeys[i];
+        fresh.days[i].cleanerMask = history[i].cleanerMask;
     }
 
-    if (length < 12 || strncmp(line, "timestamp,", 10) == 0) {
-        return CleaningHistory::None;
-    }
-
-    char *comma = strchr(line, ',');
-    if (!comma) return CleaningHistory::None;
-    return cleanerMaskFromName(comma + 1);
-}
-
-void incrementTotals(uint8_t cleanerMask)
-{
-    if (cleanerMask & CleaningHistory::Oriana) allTimeTotals.oriana++;
-    if (cleanerMask & CleaningHistory::Matthew) allTimeTotals.matthew++;
-}
-
-bool waitForSdMosiToBeReleased()
-{
-    if (digitalRead(AppConfig::OrianaButtonPin) != LOW) return true;
-
-    Serial.println("Waiting for GPIO15 button release before using SD card...");
-    uint32_t start = millis();
-    while (digitalRead(AppConfig::OrianaButtonPin) == LOW &&
-           millis() - start < 5000) {
-        delay(20);
-    }
-
-    if (digitalRead(AppConfig::OrianaButtonPin) == LOW) {
-        Serial.println("GPIO15 is still LOW; skipping SD access to protect the write.");
-        return false;
-    }
-    delay(20);
-    return true;
-}
-
-bool mountSdCard()
-{
-    // GPIO15 doubles as the Oriana button and SD MOSI on this board.
-    if (!waitForSdMosiToBeReleased()) return false;
-
-    SPI.begin(SD_SCLK, SD_MISO, SD_MOSI, SD_CS);
-    if (!SD.begin(SD_CS, SPI)) {
-        Serial.println("SD card mount failed; cleaning history will not be persisted.");
-        SPI.end();
-        pinMode(AppConfig::OrianaButtonPin, INPUT_PULLUP);
-        return false;
-    }
-
-    Serial.println("SD card mounted.");
-    return true;
-}
-
-void unmountSdCard()
-{
-    SD.end();
-    SPI.end();
-    pinMode(AppConfig::OrianaButtonPin, INPUT_PULLUP);
-}
-
-bool appendCleaningToCsv(const struct tm *cleanedAt,
-                         CleaningHistory::Cleaner cleaner)
-{
-    if (!cleanedAt || cleaner == CleaningHistory::None) return false;
-
-    File file = SD.open(AppConfig::CleaningsCsvPath, FILE_APPEND);
-    if (!file) {
-        Serial.printf("Could not open %s for append.\n",
-                      AppConfig::CleaningsCsvPath);
-        return false;
-    }
-
-    bool success = true;
-    if (file.size() == 0 && file.print("timestamp,who\n") == 0) {
-        success = false;
-    }
-
-    char timestamp[32];
-    if (strftime(timestamp, sizeof(timestamp),
-                 "%Y-%m-%dT%H:%M:%S%z", cleanedAt) == 0) {
-        success = false;
-    } else if (file.printf("%s,%s\n", timestamp,
-                           CleaningHistory::cleanerName(cleaner)) == 0) {
-        success = false;
-    }
-
-    file.flush();
-    file.close();
-
-    if (success) {
-        Serial.printf("Logged cleaning: %s, %s\n", timestamp,
-                      CleaningHistory::cleanerName(cleaner));
-    } else {
-        Serial.println("Failed while writing cleaning record to SD card.");
-    }
-    return success;
-}
-
-uint64_t cleaningCsvSize()
-{
-    File file = SD.open(AppConfig::CleaningsCsvPath, FILE_READ);
-    if (!file) return 0;
-    uint64_t size = file.size();
-    file.close();
-    return size;
-}
-
-bool writeTally(uint64_t csvSize)
-{
-    File file = SD.open(AppConfig::CleaningsTallyPath, FILE_WRITE);
-    if (!file) {
-        Serial.printf("Could not write %s.\n", AppConfig::CleaningsTallyPath);
-        return false;
-    }
-
-    bool success =
-        file.print("oriana,matthew,csv_size\n") > 0 &&
-        file.printf("%lu,%lu,%llu\n",
-                    static_cast<unsigned long>(allTimeTotals.oriana),
-                    static_cast<unsigned long>(allTimeTotals.matthew),
-                    static_cast<unsigned long long>(csvSize)) > 0;
-    file.flush();
-    file.close();
-    return success;
-}
-
-bool loadTally(uint64_t csvSize)
-{
-    File file = SD.open(AppConfig::CleaningsTallyPath, FILE_READ);
-    if (!file) return false;
-
-    char line[96];
-    file.readBytesUntil('\n', line, sizeof(line) - 1);  // Header
-    size_t length = file.readBytesUntil('\n', line, sizeof(line) - 1);
-    line[length] = '\0';
-    file.close();
-
-    unsigned long oriana = 0;
-    unsigned long matthew = 0;
-    unsigned long long storedCsvSize = 0;
-    if (sscanf(line, "%lu,%lu,%llu",
-               &oriana, &matthew, &storedCsvSize) != 3 ||
-        storedCsvSize != csvSize) {
-        return false;
-    }
-
-    allTimeTotals.oriana = oriana;
-    allTimeTotals.matthew = matthew;
-    allTimeTotalsValid = true;
-    return true;
-}
-
-void rebuildTally(uint64_t csvSize)
-{
-    allTimeTotals = {};
-
-    File file = SD.open(AppConfig::CleaningsCsvPath, FILE_READ);
-    if (file) {
-        char line[96];
-        while (file.available()) {
-            size_t length = file.readBytesUntil('\n', line, sizeof(line) - 1);
-            line[length] = '\0';
-
-            if (length == sizeof(line) - 1) {
-                while (file.available() && file.read() != '\n') {}
-                continue;
-            }
-
-            incrementTotals(cleanerMaskFromCsvLine(line));
-        }
-        file.close();
-    }
-
-    allTimeTotalsValid = true;
-    if (!writeTally(csvSize)) {
-        Serial.println("Tally cache rebuild succeeded, but cache write failed.");
-    }
-    Serial.printf("Cleaning tally: Oriana=%lu, Matthew=%lu\n",
-                  static_cast<unsigned long>(allTimeTotals.oriana),
-                  static_cast<unsigned long>(allTimeTotals.matthew));
-}
-
-void loadOrRebuildTally()
-{
-    uint64_t csvSize = cleaningCsvSize();
-    if (!loadTally(csvSize)) {
-        Serial.println("Cleaning tally missing or stale; rebuilding from CSV.");
-        rebuildTally(csvSize);
-    }
-}
-
-bool readPreviousLine(File &file, size_t &cursor,
-                      char *line, size_t lineCapacity)
-{
-    if (cursor == 0) return false;
-
-    size_t end = cursor;
-    while (end > 0) {
-        file.seek(end - 1);
-        int character = file.read();
-        if (character != '\n' && character != '\r') break;
-        end--;
-    }
-    if (end == 0) {
-        cursor = 0;
-        return false;
-    }
-
-    size_t start = end;
-    while (start > 0) {
-        file.seek(start - 1);
-        if (file.read() == '\n') break;
-        start--;
-    }
-
-    size_t lineLength = end - start;
-    cursor = start;
-    if (lineLength >= lineCapacity) {
-        line[0] = '\0';
-        return true;
-    }
-
-    file.seek(start);
-    size_t bytesRead = file.read(
-        reinterpret_cast<uint8_t *>(line), lineLength
-    );
-    line[bytesRead] = '\0';
-    return true;
-}
-
-void loadRecentHistoryFromCsv()
-{
-    File file = SD.open(AppConfig::CleaningsCsvPath, FILE_READ);
-    if (!file) {
-        Serial.printf("No %s history file yet.\n", AppConfig::CleaningsCsvPath);
-        return;
-    }
-
-    char line[96];
-    size_t cursor = file.size();
-    const char *oldestDate = history[CleaningHistory::DayCount - 1].date;
-    while (readPreviousLine(file, cursor, line, sizeof(line))) {
-        if (strlen(line) >= 10 && line[4] == '-' && line[7] == '-' &&
-            strncmp(line, oldestDate, 10) < 0) {
-            break;
-        }
-
-        uint8_t cleanerMask = cleanerMaskFromCsvLine(line);
-        if (cleanerMask != CleaningHistory::None) {
-            addCleaning(line, cleanerMask);
-        }
-    }
-
-    file.close();
+    fresh.checksum = retainedHistoryChecksum(fresh);
+    retainedHistory = fresh;
 }
 
 }  // namespace
@@ -351,45 +249,25 @@ bool isValid()
     return historyValid;
 }
 
-const Totals &totals()
-{
-    return allTimeTotals;
-}
-
-bool totalsAreValid()
-{
-    return allTimeTotalsValid;
-}
-
 void refresh(const struct tm *now,
              const struct tm *newCleaningTime,
              Cleaner newCleaner)
 {
-    historyValid = initialise(now);
+    historyValid = initialiseVisibleDays(now);
     if (!historyValid) return;
 
-    if (mountSdCard()) {
-        loadOrRebuildTally();
+    reconcileRetainedHistory();
 
-        if (newCleaningTime && newCleaner != None) {
-            if (appendCleaningToCsv(newCleaningTime, newCleaner)) {
-                incrementTotals(newCleaner);
-                if (!writeTally(cleaningCsvSize())) {
-                    Serial.println("Cleaning logged, but tally cache update failed.");
-                }
-            }
+    uint8_t cleanerMask = static_cast<uint8_t>(newCleaner);
+    if (newCleaningTime && newCleaner != None &&
+        cleanerMaskIsValid(cleanerMask)) {
+        uint32_t cleaningDateKey = 0;
+        if (dateKeyFromTime(newCleaningTime, &cleaningDateKey)) {
+            addCleaning(cleaningDateKey, cleanerMask);
         }
-        loadRecentHistoryFromCsv();
-        unmountSdCard();
     }
 
-    // Always show the new event, even if the SD card was unavailable.
-    if (newCleaningTime && newCleaner != None) {
-        char cleaningDate[11];
-        strftime(cleaningDate, sizeof(cleaningDate),
-                 "%Y-%m-%d", newCleaningTime);
-        addCleaning(cleaningDate, newCleaner);
-    }
+    retainVisibleHistory();
 }
 
 }  // namespace CleaningHistory

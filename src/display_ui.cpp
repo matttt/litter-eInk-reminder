@@ -3,7 +3,6 @@
 #include <Arduino.h>
 #include <esp_adc_cal.h>
 #include <esp_heap_caps.h>
-#include <math.h>
 
 #include "cleanImage.h"
 #include "cleaning_history.h"
@@ -105,8 +104,10 @@ const uint8_t *smallGlyph(char character)
     static const uint8_t n[] = {0x00, 0x16, 0x19, 0x11, 0x11, 0x11, 0x11};
     static const uint8_t o[] = {0x00, 0x0E, 0x11, 0x11, 0x11, 0x11, 0x0E};
     static const uint8_t r[] = {0x00, 0x16, 0x19, 0x10, 0x10, 0x10, 0x10};
+    static const uint8_t s[] = {0x00, 0x0F, 0x10, 0x0E, 0x01, 0x01, 0x1E};
     static const uint8_t t[] = {0x04, 0x04, 0x0E, 0x04, 0x04, 0x05, 0x02};
     static const uint8_t u[] = {0x00, 0x11, 0x11, 0x11, 0x11, 0x13, 0x0D};
+    static const uint8_t y[] = {0x00, 0x11, 0x11, 0x0F, 0x01, 0x11, 0x0E};
     static const uint8_t unknown[] = {0x0E, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04};
 
     switch (character) {
@@ -125,8 +126,10 @@ const uint8_t *smallGlyph(char character)
         case 'n': return n;
         case 'o': return o;
         case 'r': return r;
+        case 's': return s;
         case 't': return t;
         case 'u': return u;
+        case 'y': return y;
         default:  return unknown;
     }
 }
@@ -137,7 +140,7 @@ void drawSmallTextVerticallyCentered(const char *text, int x,
     constexpr int GlyphWidth = 5;
     constexpr int GlyphHeight = 7;
     constexpr int Scale = 2;
-    constexpr int LetterSpacing = 2;
+    constexpr int LetterSpacing = 1;
     int y = boxY + (boxHeight - GlyphHeight * Scale) / 2;
 
     for (const char *character = text; *character != '\0'; ++character) {
@@ -158,10 +161,10 @@ void drawCleaningHistory()
 {
     constexpr int PanelX = 772;
     constexpr int ContentX = PanelX + 17;
-    constexpr int DayLabelX = ContentX + 20;
+    constexpr int DayLabelX = ContentX;
     constexpr int RowTop = 52;
     constexpr int RowHeight = 55;
-    constexpr int BoxX = 887;
+    constexpr int BoxX = 895;
     constexpr int BoxWidth = 54;
     constexpr int BoxHeight = 38;
 
@@ -211,93 +214,6 @@ void drawCleaningHistory()
                              BoxWidth, BoxHeight, &props);
         }
     }
-}
-
-void drawAllTimePieChart(bool shouldShow)
-{
-    if (!shouldShow || !CleaningHistory::totalsAreValid()) return;
-
-    constexpr int CenterX = 78;
-    constexpr int CenterY = 390;
-    constexpr int Radius = 58;
-    constexpr int SwatchX = 152;
-    constexpr int LabelX = 177;
-    constexpr uint8_t OrianaGray = 0x99;
-    constexpr float FullCircle = 6.28318530718f;
-
-    const CleaningHistory::Totals &totals = CleaningHistory::totals();
-    uint64_t total = static_cast<uint64_t>(totals.matthew) + totals.oriana;
-    uint32_t matthewPercent = 0;
-    uint32_t orianaPercent = 0;
-
-    if (total > 0) {
-        matthewPercent = static_cast<uint32_t>(
-            (static_cast<uint64_t>(totals.matthew) * 100 + total / 2) / total
-        );
-        orianaPercent = 100 - matthewPercent;
-
-        float matthewAngle = FullCircle * totals.matthew / total;
-        for (int y = -Radius; y <= Radius; ++y) {
-            for (int x = -Radius; x <= Radius; ++x) {
-                if (x * x + y * y > Radius * Radius) continue;
-
-                // Measure clockwise from 12 o'clock.
-                float angle = atan2f(static_cast<float>(x),
-                                     static_cast<float>(-y));
-                if (angle < 0) angle += FullCircle;
-                uint8_t color = angle < matthewAngle ? 0x00 : OrianaGray;
-                epd_draw_pixel(CenterX + x, CenterY + y,
-                               color, framebuffer);
-            }
-        }
-
-        if (totals.matthew > 0 && totals.oriana > 0) {
-            int boundaryX = CenterX +
-                static_cast<int>(sinf(matthewAngle) * Radius);
-            int boundaryY = CenterY -
-                static_cast<int>(cosf(matthewAngle) * Radius);
-            epd_draw_line(CenterX, CenterY, CenterX, CenterY - Radius,
-                          0x00, framebuffer);
-            epd_draw_line(CenterX, CenterY, boundaryX, boundaryY,
-                          0x00, framebuffer);
-        }
-    }
-
-    epd_draw_circle(CenterX, CenterY, Radius, 0x00, framebuffer);
-    epd_draw_circle(CenterX, CenterY, Radius - 1, 0x00, framebuffer);
-
-    FontProperties props = {
-        .fg_color = 0,
-        .bg_color = 15,
-        .fallback_glyph = 0,
-        .flags = 0
-    };
-    GFXfont *font = (GFXfont *)&OpenSans12B;
-
-    int titleX = 20;
-    int titleY = 300;
-    write_mode(font, "stats day!", &titleX, &titleY,
-               framebuffer, BLACK_ON_WHITE, &props);
-
-    epd_fill_rect(SwatchX, 359, 16, 16, 0x00, framebuffer);
-    epd_draw_rect(SwatchX, 359, 16, 16, 0x00, framebuffer);
-    epd_fill_rect(SwatchX, 400, 16, 16, OrianaGray, framebuffer);
-    epd_draw_rect(SwatchX, 400, 16, 16, 0x00, framebuffer);
-
-    char label[24];
-    snprintf(label, sizeof(label), "M %lu%%",
-             static_cast<unsigned long>(matthewPercent));
-    int labelX = LabelX;
-    int labelY = 377;
-    write_mode(font, label, &labelX, &labelY,
-               framebuffer, BLACK_ON_WHITE, &props);
-
-    snprintf(label, sizeof(label), "O %lu%%",
-             static_cast<unsigned long>(orianaPercent));
-    labelX = LabelX;
-    labelY = 418;
-    write_mode(font, label, &labelX, &labelY,
-               framebuffer, BLACK_ON_WHITE, &props);
 }
 
 const char *weekdayShort(int weekday)
@@ -386,7 +302,6 @@ void copySelectedImageToFramebuffer(const DisplayUi::State &state)
 
     drawLastCleanStamp(state);
     drawCleaningHistory();
-    drawAllTimePieChart(state.showAllTimePieChart);
     drawBatteryWarning();
 }
 
