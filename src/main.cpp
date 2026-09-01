@@ -32,6 +32,8 @@ namespace {
 
 volatile uint8_t awakeCleanerMask = CleaningHistory::None;
 bool awakeCleanerCaptureActive = false;
+bool orianaCapturePausedForSd = false;
+bool showMonthlySummary = false;
 portMUX_TYPE awakeCleanerMux = portMUX_INITIALIZER_UNLOCKED;
 
 struct WakeSources {
@@ -105,6 +107,7 @@ void beginCapturingAwakeCleanerPresses(uint8_t initialMask)
         attachInterrupt(digitalPinToInterrupt(AppConfig::MatthewButtonPin),
                         captureMatthewPress, FALLING);
         awakeCleanerCaptureActive = true;
+        orianaCapturePausedForSd = false;
     }
 
     // Close the small gap between the initial sample and ISR attachment.
@@ -117,12 +120,36 @@ void beginCapturingAwakeCleanerPresses(uint8_t initialMask)
     }
 }
 
+void pauseOrianaCaptureForSd()
+{
+    if (!awakeCleanerCaptureActive || orianaCapturePausedForSd) return;
+
+    detachInterrupt(digitalPinToInterrupt(AppConfig::OrianaButtonPin));
+    orianaCapturePausedForSd = true;
+}
+
+void resumeOrianaCaptureAfterSd()
+{
+    if (!awakeCleanerCaptureActive || !orianaCapturePausedForSd) return;
+
+    pinMode(AppConfig::OrianaButtonPin, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(AppConfig::OrianaButtonPin),
+                    captureOrianaPress, FALLING);
+    orianaCapturePausedForSd = false;
+
+    // Close the interrupt-detached handoff gap for a press that remains held.
+    if (digitalRead(AppConfig::OrianaButtonPin) == LOW) {
+        mergeAwakeCleanerMask(CleaningHistory::Oriana);
+    }
+}
+
 DisplayUi::State displayState()
 {
     DisplayUi::State state = {};
     state.lastCleanTimestampValid = rtcCleanTimestampValid;
     state.lastCleanTime = rtcLastCleanTime;
     state.reminderOverdue = rtcReminderOverdue;
+    state.showAllTimePieChart = showMonthlySummary;
     return state;
 }
 
@@ -212,9 +239,9 @@ void waitForCleaningButtonsToBeReleased()
 
 bool programmingButtonIsHeld()
 {
-    // GPIO0 is also the e-paper controller's CFG_STR signal. Rendering leaves
-    // it configured as an output, so return it to input mode before sampling
-    // the physical BOOT button.
+    // GPIO0 is also the e-paper controller's CFG_STR signal. Explicitly return
+    // it to input mode before sampling the physical BOOT button even if a
+    // display operation was interrupted.
     rtc_gpio_deinit((gpio_num_t)AppConfig::ProgrammingButtonPin);
     pinMode(AppConfig::ProgrammingButtonPin, INPUT_PULLUP);
     delay(10);
@@ -275,6 +302,15 @@ void logScheduledEvents(ClockService::ScheduledEventMask events)
     }
 }
 
+void refreshCleaningHistory(const struct tm *now,
+                            const struct tm *newCleaningTime = nullptr,
+                            CleaningHistory::Cleaner newCleaner =
+                                CleaningHistory::None)
+{
+    showMonthlySummary = now && now->tm_mday == 1;
+    CleaningHistory::refresh(now, newCleaningTime, newCleaner);
+}
+
 void applyScheduledEvents(ClockService::ScheduledEventMask events,
                           const struct tm *now)
 {
@@ -283,7 +319,7 @@ void applyScheduledEvents(ClockService::ScheduledEventMask events,
             events, ClockService::ScheduledEventCleaningReminder)) {
         rtcReminderOverdue = true;
     }
-    if (now) CleaningHistory::refresh(now);
+    if (now) refreshCleaningHistory(now);
 }
 
 void recordCleanerMask(uint8_t cleanerMask)
@@ -311,7 +347,7 @@ void recordCleanerMask(uint8_t cleanerMask)
 
         rtcPendingCleanerMask = CleaningHistory::None;
         rtcLastCleanTime = now;
-        CleaningHistory::refresh(&now, &now, cleaner);
+        refreshCleaningHistory(&now, &now, cleaner);
         ClockService::scheduleCleaningReminder24HoursAfter(&now);
     } else {
         rtcPendingCleanerMask |= cleanerMask;
@@ -513,6 +549,44 @@ void enterDeepSleep()
             );
             continue;
         }
+
+        // Clear the complete display power register only once all rendering
+        // and last-chance input processing have finished.
+        DisplayUi::prepareForDeepSleep();
+        if (!CleaningHistory::prepareForDeepSleep()) {
+            Serial.println(
+                "Failed to retain SD clock LOW; entering deep sleep anyway."
+            );
+            Serial.flush();
+        }
+
+        // SD/display teardown is deliberately last, but it still takes a
+        // finite amount of time. Drain one final button edge before sleeping;
+        // restore the SD clock pad first because recording can mount the card.
+        uint64_t lateButtonStatus = sampleCleanerPins();
+        if (lateButtonStatus &
+            (1ULL << AppConfig::OrianaButtonPin)) {
+            mergeAwakeCleanerMask(CleaningHistory::Oriana);
+        }
+        if (lateButtonStatus &
+            (1ULL << AppConfig::MatthewButtonPin)) {
+            mergeAwakeCleanerMask(CleaningHistory::Matthew);
+        }
+        uint8_t lateCleanerMask = consumeAwakeCleanerMask();
+        if (lateCleanerMask != CleaningHistory::None) {
+            CleaningHistory::beginWakeCycle();
+            recordCleanerMask(lateCleanerMask);
+            continue;
+        }
+
+        if (useRtcAlarmWake &&
+            digitalRead(AppConfig::RtcIrqPin) == LOW) {
+            CleaningHistory::beginWakeCycle();
+            Serial.println(
+                "RTC IRQ asserted during final teardown; servicing it awake."
+            );
+            continue;
+        }
         esp_deep_sleep_start();
     }
 }
@@ -627,7 +701,7 @@ void handleColdBoot()
 
     struct tm now;
     if (ClockService::getLocalTime(&now)) {
-        CleaningHistory::refresh(&now);
+        refreshCleaningHistory(&now);
         ClockService::resetScheduledEvents(&now);
     } else {
         ClockService::resetScheduledEvents();
@@ -644,6 +718,7 @@ void setup()
 
     Serial.begin(115200);
     ClockService::configureLocalTimezone();
+    CleaningHistory::beginWakeCycle();
     configureWakePins();
 
     // Capture wake information before display/RTC initialisation so a cleaner
@@ -653,6 +728,10 @@ void setup()
     beginCapturingAwakeCleanerPresses(static_cast<uint8_t>(
         determineCleaner(wakeSources.ext1Status)
     ));
+    CleaningHistory::setSdAccessHooks(
+        pauseOrianaCaptureForSd,
+        resumeOrianaCaptureAfterSd
+    );
 
     delay(200);
 

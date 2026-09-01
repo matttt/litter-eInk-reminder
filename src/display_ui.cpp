@@ -3,7 +3,9 @@
 #include <Arduino.h>
 #include <esp_adc_cal.h>
 #include <esp_heap_caps.h>
+#include <math.h>
 
+#include "app_config.h"
 #include "cleanImage.h"
 #include "cleaning_history.h"
 #include "dirtyImage.h"
@@ -19,6 +21,19 @@ enum DisplayMode { DisplayDirty, DisplayClean };
 uint8_t *framebuffer = nullptr;
 int adcVref = 1100;
 DisplayMode currentMode = DisplayDirty;
+
+void claimEpdConfigPin()
+{
+    // GPIO0 doubles as the programming button. Main leaves it as an input
+    // while sampling that button, but the EPD driver's push_cfg() toggles the
+    // output register directly and assumes CFG_STR is already an output.
+    pinMode(AppConfig::ProgrammingButtonPin, OUTPUT);
+}
+
+void releaseEpdConfigPin()
+{
+    pinMode(AppConfig::ProgrammingButtonPin, INPUT_PULLUP);
+}
 
 float readBatteryVoltage()
 {
@@ -216,6 +231,93 @@ void drawCleaningHistory()
     }
 }
 
+void drawAllTimePieChart(bool shouldShow)
+{
+    if (!shouldShow || !CleaningHistory::totalsAreValid()) return;
+
+    constexpr int CenterX = 78;
+    constexpr int CenterY = 390;
+    constexpr int Radius = 58;
+    constexpr int SwatchX = 152;
+    constexpr int LabelX = 177;
+    constexpr uint8_t OrianaGray = 0x99;
+    constexpr float FullCircle = 6.28318530718f;
+
+    const CleaningHistory::Totals &totals = CleaningHistory::totals();
+    uint64_t total = static_cast<uint64_t>(totals.matthew) + totals.oriana;
+    uint32_t matthewPercent = 0;
+    uint32_t orianaPercent = 0;
+
+    if (total > 0) {
+        matthewPercent = static_cast<uint32_t>(
+            (static_cast<uint64_t>(totals.matthew) * 100 + total / 2) / total
+        );
+        orianaPercent = 100 - matthewPercent;
+
+        float matthewAngle = FullCircle * totals.matthew / total;
+        for (int y = -Radius; y <= Radius; ++y) {
+            for (int x = -Radius; x <= Radius; ++x) {
+                if (x * x + y * y > Radius * Radius) continue;
+
+                // Measure clockwise from 12 o'clock.
+                float angle = atan2f(static_cast<float>(x),
+                                     static_cast<float>(-y));
+                if (angle < 0) angle += FullCircle;
+                uint8_t color = angle < matthewAngle ? 0x00 : OrianaGray;
+                epd_draw_pixel(CenterX + x, CenterY + y,
+                               color, framebuffer);
+            }
+        }
+
+        if (totals.matthew > 0 && totals.oriana > 0) {
+            int boundaryX = CenterX +
+                static_cast<int>(sinf(matthewAngle) * Radius);
+            int boundaryY = CenterY -
+                static_cast<int>(cosf(matthewAngle) * Radius);
+            epd_draw_line(CenterX, CenterY, CenterX, CenterY - Radius,
+                          0x00, framebuffer);
+            epd_draw_line(CenterX, CenterY, boundaryX, boundaryY,
+                          0x00, framebuffer);
+        }
+    }
+
+    epd_draw_circle(CenterX, CenterY, Radius, 0x00, framebuffer);
+    epd_draw_circle(CenterX, CenterY, Radius - 1, 0x00, framebuffer);
+
+    FontProperties props = {
+        .fg_color = 0,
+        .bg_color = 15,
+        .fallback_glyph = 0,
+        .flags = 0
+    };
+    GFXfont *font = (GFXfont *)&OpenSans12B;
+
+    int titleX = 20;
+    int titleY = 300;
+    write_mode(font, "stats day!", &titleX, &titleY,
+               framebuffer, BLACK_ON_WHITE, &props);
+
+    epd_fill_rect(SwatchX, 359, 16, 16, 0x00, framebuffer);
+    epd_draw_rect(SwatchX, 359, 16, 16, 0x00, framebuffer);
+    epd_fill_rect(SwatchX, 400, 16, 16, OrianaGray, framebuffer);
+    epd_draw_rect(SwatchX, 400, 16, 16, 0x00, framebuffer);
+
+    char label[24];
+    snprintf(label, sizeof(label), "M %lu%%",
+             static_cast<unsigned long>(matthewPercent));
+    int labelX = LabelX;
+    int labelY = 377;
+    write_mode(font, label, &labelX, &labelY,
+               framebuffer, BLACK_ON_WHITE, &props);
+
+    snprintf(label, sizeof(label), "O %lu%%",
+             static_cast<unsigned long>(orianaPercent));
+    labelX = LabelX;
+    labelY = 418;
+    write_mode(font, label, &labelX, &labelY,
+               framebuffer, BLACK_ON_WHITE, &props);
+}
+
 const char *weekdayShort(int weekday)
 {
     static const char *days[] = {
@@ -302,12 +404,14 @@ void copySelectedImageToFramebuffer(const DisplayUi::State &state)
 
     drawLastCleanStamp(state);
     drawCleaningHistory();
+    drawAllTimePieChart(state.showAllTimePieChart);
     drawBatteryWarning();
 }
 
 void refreshDisplay(const DisplayUi::State &state)
 {
     copySelectedImageToFramebuffer(state);
+    claimEpdConfigPin();
     epd_poweron();
     epd_clear();
     yield();
@@ -315,6 +419,7 @@ void refreshDisplay(const DisplayUi::State &state)
     epd_draw_grayscale_image(epd_full_screen(), framebuffer);
     Serial.printf("EPD draw took %lums\r\n", millis() - start);
     epd_poweroff();
+    releaseEpdConfigPin();
     yield();
 }
 
@@ -362,6 +467,16 @@ void showClean(const State &state)
     currentMode = DisplayClean;
     Serial.println("Rendering CLEAN image");
     refreshDisplay(state);
+}
+
+void prepareForDeepSleep()
+{
+    // The lightweight per-refresh poweroff leaves the board's PWR_EN output
+    // asserted. LilyGo's own sleep example clears the complete EPD power
+    // register only at the final sleep handoff.
+    claimEpdConfigPin();
+    epd_poweroff_all();
+    releaseEpdConfigPin();
 }
 
 }  // namespace DisplayUi

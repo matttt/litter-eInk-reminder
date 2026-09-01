@@ -8,9 +8,9 @@ https://github.com/user-attachments/assets/5ce3907d-8147-40a7-92b5-2e27a177cc9c
 
 Firmware for the LILYGO T5 4.7-inch e-paper V2.3 (`T5-ePaper-S3`). It displays
 the litter-box state, records the last cleaning time, keeps a seven-day cleaner
-history in ESP32 RTC memory, schedules midnight refreshes and a 24-hour cleaning
-reminder through the onboard PCF8563 RTC, and spends the rest of its time in
-deep sleep.
+history in ESP32 RTC memory and on SD card, maintains all-time cleaner totals,
+schedules midnight refreshes and a 24-hour cleaning reminder through the
+onboard PCF8563 RTC, and spends the rest of its time in deep sleep.
 
 ## PlatformIO
 
@@ -27,8 +27,8 @@ The firmware source is split by responsibility:
 | --- | --- |
 | `main.cpp` | Wake handling, deep-sleep state, and application flow |
 | `clock_service.*` | PCF8563 RTC, NTP sync, and midnight/reminder scheduling |
-| `cleaning_history.*` | Cleaner identities and the RTC-backed seven-day history |
-| `display_ui.*` | E-paper rendering, cleaner history panel, and battery warning |
+| `cleaning_history.*` | RTC history cache, SD CSV log, and all-time tally |
+| `display_ui.*` | E-paper rendering, history panel, monthly pie chart, and battery warning |
 | `app_config.h` | Pins, network settings, time zone, and application constants |
 
 Build the firmware:
@@ -64,8 +64,16 @@ run the firmware.
 | Matthew clean button / built-in user button | 21 |
 | Programming-mode button / e-paper CFG_STR | 0 |
 | Battery ADC | 14 |
+| SD MISO / MOSI / SCLK / CS | 16 / 15 / 11 / 42 |
 
-Both clean buttons are active-low.
+Both clean buttons are active-low. GPIO 15 is shared with the SD card's MOSI
+line. Before each SD session the firmware waits for that button to be released,
+temporarily suspends its awake interrupt, and restores the pulled-up button
+input afterward. A press held through the handoff is preserved, but pressing
+Oriana during an active SD transfer can still corrupt the transfer because the
+button and MOSI are physically the same signal. A short press entirely within
+that transfer can also be missed; fully eliminating this limitation requires a
+board-level pin remap or isolation between the button and MOSI.
 
 Hold GPIO 0 while the firmware is preparing to sleep to enter programming
 mode. The input must remain low for 100 ms; reset/boot transients are ignored.
@@ -79,9 +87,39 @@ At midnight the rows advance, the previous `Today` row receives its weekday
 label, and a blank `Today` row appears at the top. `M` means Matthew, `O` means
 Oriana, and `MO` means both people recorded a cleaning that day.
 
-This seven-day window lives only in ESP32 RTC slow memory. It survives deep
-sleep, but a power loss or cold reset starts a fresh window; no cleaning events
-are written to persistent storage.
+The seven-day window is cached with a checksum in ESP32 RTC slow memory for fast
+deep-sleep continuity and reconstructed from the SD log after a power loss or
+cold reset. When the SD card is available, each cleaning is appended to
+`/cleanings.csv`:
+
+```csv
+timestamp,who
+2026-08-20T18:15:00-0700,Oriana
+```
+
+All-time totals are cached in `/cleanings.tally`:
+
+```csv
+oriana,matthew,csv_size
+210,311,24387
+```
+
+The CSV byte size is used as a lightweight tally cache key. If the size changes
+without a matching tally update, the firmware rebuilds the totals from the
+complete log. Normal wakeups load the tally and scan backward only through the
+recent rows needed for the seven-day display. On the first day of each month,
+the lower-left of the display shows the all-time Matthew/Oriana pie chart.
+
+If an SD mount or write fails, the cleaning remains in the RTC seven-day view
+across deep sleep, but it is not queued for a later CSV retry. A cold reset or
+power loss can therefore lose that unpersisted event from the history and
+all-time tally.
+
+Before deep sleep, the firmware flushes and closes files, unmounts the card,
+stops SPI, holds SD clock GPIO 11 low through the RTC I/O domain, and relies on
+the board's physical pull-up to keep chip select high. The SD card shares the
+ESP32's 3.3 V rail, so it remains powered and settles to its card-specific idle
+current rather than being electrically switched off.
 
 The PCF8563 exposes one calendar alarm, so the firmware keeps two logical
 deadlines: the next local midnight and, after a cleaning, its 24-hour reminder.

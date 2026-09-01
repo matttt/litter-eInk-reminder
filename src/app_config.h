@@ -14,6 +14,9 @@ constexpr uint8_t RtcSdaPin = 18;
 constexpr uint8_t RtcSclPin = 17;
 constexpr uint8_t RtcIrqPin = 9;
 
+constexpr char CleaningsCsvPath[] = "/cleanings.csv";
+constexpr char CleaningsTallyPath[] = "/cleanings.tally";
+
 // Sync NTP every N alarm wakeups. Set to 1 to sync every time.
 constexpr uint32_t NtpSyncInterval = 30;
 

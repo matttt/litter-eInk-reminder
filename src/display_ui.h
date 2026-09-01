@@ -8,10 +8,12 @@ struct State {
     bool lastCleanTimestampValid;
     struct tm lastCleanTime;
     bool reminderOverdue;
+    bool showAllTimePieChart;
 };
 
 bool initialise();
 void showDirty(const State &state);
 void showClean(const State &state);
+void prepareForDeepSleep();
 
 }  // namespace DisplayUi
