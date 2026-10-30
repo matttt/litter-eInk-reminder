@@ -2,16 +2,13 @@
 
 #include <Arduino.h>
 #include <FS.h>
-#include <SD.h>
-#include <SPI.h>
+#include <LittleFS.h>
+#include <esp_partition.h>
 #include <ctype.h>
-#include <driver/gpio.h>
-#include <driver/rtc_io.h>
 #include <string.h>
 #include <strings.h>
 
 #include "app_config.h"
-#include "utilities.h"
 
 namespace {
 
@@ -43,9 +40,6 @@ uint32_t visibleDateKeys[CleaningHistory::DayCount] = {};
 bool historyValid = false;
 CleaningHistory::Totals allTimeTotals = {};
 bool allTimeTotalsValid = false;
-CleaningHistory::SdAccessHook beforeSdAccess = nullptr;
-CleaningHistory::SdAccessHook afterSdAccess = nullptr;
-bool sdBusClaimed = false;
 
 void addCleaning(uint32_t dateKey, uint8_t cleanerMask);
 
@@ -204,86 +198,63 @@ void incrementTotals(uint8_t cleanerMask)
     if (cleanerMask & CleaningHistory::Matthew) allTimeTotals.matthew++;
 }
 
-void setSdBusIdlePins()
+// Keep the existing partition label so firmware uploads do not move storage.
+constexpr char FlashPartitionLabel[] = "spiffs";
+
+bool flashPartitionIsBlank()
 {
-    digitalWrite(SD_CS, HIGH);
-    pinMode(SD_CS, OUTPUT);
-    digitalWrite(SD_SCLK, LOW);
-    pinMode(SD_SCLK, OUTPUT);
-    pinMode(SD_MISO, INPUT_PULLUP);
-    pinMode(AppConfig::OrianaButtonPin, INPUT_PULLUP);
-}
+    const esp_partition_t *partition = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS,
+        FlashPartitionLabel
+    );
+    if (!partition) return false;
 
-void releaseSdBus()
-{
-    SD.end();
-    SPI.end();
-    setSdBusIdlePins();
-
-    if (sdBusClaimed) {
-        // Let the shared GPIO15 line settle HIGH before its button interrupt
-        // is reattached. SPI output transitions must never become cleanings.
-        delay(1);
-        sdBusClaimed = false;
-        if (afterSdAccess) afterSdAccess();
+    // Only initialise erased flash. A mount failure on an existing filesystem
+    // must never silently erase cleaning records. Check the entire partition,
+    // not just the first block (a damaged filesystem may have an erased head).
+    uint8_t buffer[256];
+    for (size_t offset = 0; offset < partition->size;) {
+        size_t length = partition->size - offset;
+        if (length > sizeof(buffer)) length = sizeof(buffer);
+        if (esp_partition_read(partition, offset, buffer, length) != ESP_OK) {
+            return false;
+        }
+        for (size_t i = 0; i < length; ++i) {
+            if (buffer[i] != 0xFF) return false;
+        }
+        offset += length;
+        yield();
     }
-}
-
-bool waitForSdMosiToBeReleased()
-{
-    if (digitalRead(AppConfig::OrianaButtonPin) != LOW) return true;
-
-    Serial.println("Waiting for GPIO15 button release before using SD card...");
-    uint32_t start = millis();
-    while (digitalRead(AppConfig::OrianaButtonPin) == LOW &&
-           millis() - start < 5000) {
-        delay(20);
-    }
-
-    if (digitalRead(AppConfig::OrianaButtonPin) == LOW) {
-        Serial.println(
-            "GPIO15 is still LOW; skipping SD access to protect the write."
-        );
-        return false;
-    }
-    delay(20);
     return true;
 }
 
-bool mountSdCard()
+bool mountFlash()
 {
-    // GPIO15 doubles as the Oriana button and SD MOSI. Its awake interrupt is
-    // paused before SPI takes ownership so MOSI edges cannot record cleanings.
-    if (!waitForSdMosiToBeReleased()) return false;
-    if (beforeSdAccess) beforeSdAccess();
-    sdBusClaimed = true;
-
-    // Close the release-to-SPI ownership gap. A button that went LOW after
-    // the first check must not be driven against MOSI or corrupt a write.
-    if (digitalRead(AppConfig::OrianaButtonPin) == LOW) {
-        Serial.println("GPIO15 went LOW during SD handoff; skipping SD access.");
-        releaseSdBus();
-        return false;
+    if (!LittleFS.begin(false, "/littlefs", 4, FlashPartitionLabel)) {
+        if (!flashPartitionIsBlank()) {
+            Serial.println(
+                "Flash mount failed; preserving existing storage. "
+                "Cleaning history will remain in RTC memory only."
+            );
+            return false;
+        }
+        Serial.println("Initialising blank internal flash storage...");
+        if (!LittleFS.format() ||
+            !LittleFS.begin(false, "/littlefs", 4, FlashPartitionLabel)) {
+            Serial.println("Could not initialise internal flash storage.");
+            return false;
+        }
     }
 
-    rtc_gpio_hold_dis((gpio_num_t)SD_SCLK);
-    rtc_gpio_deinit((gpio_num_t)SD_SCLK);
-    SPI.begin(SD_SCLK, SD_MISO, SD_MOSI, SD_CS);
-    if (!SD.begin(SD_CS, SPI)) {
-        Serial.println(
-            "SD card mount failed; cleaning history will not be persisted."
-        );
-        releaseSdBus();
-        return false;
-    }
-
-    Serial.println("SD card mounted.");
+    Serial.printf("Flash storage: %lu / %lu bytes used.\n",
+                  static_cast<unsigned long>(LittleFS.usedBytes()),
+                  static_cast<unsigned long>(LittleFS.totalBytes()));
     return true;
 }
 
 bool writeFreshCleaningCsvHeader()
 {
-    File file = SD.open(AppConfig::CleaningsCsvPath, FILE_WRITE);
+    File file = LittleFS.open(AppConfig::CleaningsCsvPath, FILE_WRITE);
     if (!file) {
         Serial.println("Could not create cleaning CSV header.");
         return false;
@@ -296,7 +267,7 @@ bool writeFreshCleaningCsvHeader()
     file.flush();
     file.close();
 
-    File verification = SD.open(AppConfig::CleaningsCsvPath, FILE_READ);
+    File verification = LittleFS.open(AppConfig::CleaningsCsvPath, FILE_READ);
     success = success && verification &&
               verification.size() == HeaderLength;
     if (verification) verification.close();
@@ -306,9 +277,9 @@ bool writeFreshCleaningCsvHeader()
 
 bool prepareCsvForAppend()
 {
-    File file = SD.open(AppConfig::CleaningsCsvPath, FILE_READ);
+    File file = LittleFS.open(AppConfig::CleaningsCsvPath, FILE_READ);
     if (!file) {
-        if (SD.exists(AppConfig::CleaningsCsvPath)) {
+        if (LittleFS.exists(AppConfig::CleaningsCsvPath)) {
             Serial.println("Existing cleaning CSV could not be read.");
             return false;
         }
@@ -343,7 +314,7 @@ bool prepareCsvForAppend()
             return false;
         }
 
-        file = SD.open(AppConfig::CleaningsCsvPath, FILE_APPEND);
+        file = LittleFS.open(AppConfig::CleaningsCsvPath, FILE_APPEND);
         if (!file) {
             Serial.println("Could not complete partial cleaning CSV header.");
             return false;
@@ -356,7 +327,7 @@ bool prepareCsvForAppend()
         file.flush();
         file.close();
 
-        File verification = SD.open(AppConfig::CleaningsCsvPath, FILE_READ);
+        File verification = LittleFS.open(AppConfig::CleaningsCsvPath, FILE_READ);
         success = success && verification &&
                   verification.size() == HeaderLength;
         if (verification) verification.close();
@@ -373,7 +344,7 @@ bool prepareCsvForAppend()
     file.close();
     if (lastCharacter == '\n') return true;
 
-    file = SD.open(AppConfig::CleaningsCsvPath, FILE_APPEND);
+    file = LittleFS.open(AppConfig::CleaningsCsvPath, FILE_APPEND);
     if (!file) {
         Serial.println("Could not repair unterminated cleaning CSV row.");
         return false;
@@ -398,7 +369,7 @@ bool appendCleaningToCsv(const struct tm *cleanedAt,
     // Arduino-ESP32 2.0.x does not initialise cached stat data reliably when
     // FILE_APPEND creates a new file. Require the preparation step to have
     // created the header, and snapshot size through a separate read handle.
-    File existing = SD.open(AppConfig::CleaningsCsvPath, FILE_READ);
+    File existing = LittleFS.open(AppConfig::CleaningsCsvPath, FILE_READ);
     if (!existing) {
         Serial.println("Could not reopen cleaning CSV before append.");
         return false;
@@ -410,7 +381,7 @@ bool appendCleaningToCsv(const struct tm *cleanedAt,
         return false;
     }
 
-    File file = SD.open(AppConfig::CleaningsCsvPath, FILE_APPEND);
+    File file = LittleFS.open(AppConfig::CleaningsCsvPath, FILE_APPEND);
     if (!file) {
         Serial.printf("Could not open %s for append.\n",
                       AppConfig::CleaningsCsvPath);
@@ -444,7 +415,7 @@ bool appendCleaningToCsv(const struct tm *cleanedAt,
     file.flush();
     file.close();
 
-    File verification = SD.open(AppConfig::CleaningsCsvPath, FILE_READ);
+    File verification = LittleFS.open(AppConfig::CleaningsCsvPath, FILE_READ);
     success = success && verification &&
               verification.size() == initialSize + expectedBytes;
     if (verification) verification.close();
@@ -453,14 +424,14 @@ bool appendCleaningToCsv(const struct tm *cleanedAt,
         Serial.printf("Logged cleaning: %s, %s\n", timestamp,
                       CleaningHistory::cleanerName(cleaner));
     } else {
-        Serial.println("Failed while writing cleaning record to SD card.");
+        Serial.println("Failed while writing cleaning record to internal flash.");
     }
     return success;
 }
 
 uint64_t cleaningCsvSize()
 {
-    File file = SD.open(AppConfig::CleaningsCsvPath, FILE_READ);
+    File file = LittleFS.open(AppConfig::CleaningsCsvPath, FILE_READ);
     if (!file) return 0;
     uint64_t size = file.size();
     file.close();
@@ -469,7 +440,7 @@ uint64_t cleaningCsvSize()
 
 bool writeTally(uint64_t csvSize)
 {
-    File file = SD.open(AppConfig::CleaningsTallyPath, FILE_WRITE);
+    File file = LittleFS.open(AppConfig::CleaningsTallyPath, FILE_WRITE);
     if (!file) {
         Serial.printf("Could not write %s.\n", AppConfig::CleaningsTallyPath);
         return false;
@@ -488,7 +459,7 @@ bool writeTally(uint64_t csvSize)
 
 bool loadTally(uint64_t csvSize)
 {
-    File file = SD.open(AppConfig::CleaningsTallyPath, FILE_READ);
+    File file = LittleFS.open(AppConfig::CleaningsTallyPath, FILE_READ);
     if (!file) return false;
 
     char header[40] = {};
@@ -534,7 +505,7 @@ void rebuildTally(uint64_t csvSize)
     allTimeTotalsValid = false;
     bool scanSucceeded = true;
 
-    File file = SD.open(AppConfig::CleaningsCsvPath, FILE_READ);
+    File file = LittleFS.open(AppConfig::CleaningsCsvPath, FILE_READ);
     if (file && file.isDirectory()) {
         file.close();
         Serial.println("Cleaning CSV path is a directory; tally unavailable.");
@@ -640,7 +611,7 @@ bool applyRecentCsvLine(char *reversedLine, size_t lineLength,
 
 void loadRecentHistoryFromCsv()
 {
-    File file = SD.open(AppConfig::CleaningsCsvPath, FILE_READ);
+    File file = LittleFS.open(AppConfig::CleaningsCsvPath, FILE_READ);
     if (!file) {
         Serial.printf("No %s history file yet.\n", AppConfig::CleaningsCsvPath);
         return;
@@ -664,9 +635,8 @@ void loadRecentHistoryFromCsv()
         visibleDateKeys[CleaningHistory::DayCount - 1];
     uint32_t startedAt = millis();
 
-    // Read whole SD sectors and parse their bytes backward in RAM. The old
-    // implementation called seek() once per character, which can turn even a
-    // modest FAT file into minutes of random SD I/O.
+    // Read blocks and parse their bytes backward in RAM to avoid a filesystem
+    // seek for every character. Stop after the visible seven-day window.
     while (cursor > 0 && !stopScanning) {
         size_t blockStart = cursor > ReadBlockSize
             ? cursor - ReadBlockSize : 0;
@@ -884,63 +854,11 @@ bool totalsAreValid()
     return allTimeTotalsValid;
 }
 
-void setSdAccessHooks(SdAccessHook beforeAccess, SdAccessHook afterAccess)
-{
-    beforeSdAccess = beforeAccess;
-    afterSdAccess = afterAccess;
-}
-
-void beginWakeCycle()
-{
-    // Program the backing RTC output LOW while its retained pad state is still
-    // held, then hand the pin back to digital GPIO without a clock glitch.
-    gpio_num_t clockPin = (gpio_num_t)SD_SCLK;
-    rtc_gpio_init(clockPin);
-    rtc_gpio_pullup_dis(clockPin);
-    rtc_gpio_pulldown_dis(clockPin);
-    rtc_gpio_set_level(clockPin, 0);
-    rtc_gpio_set_direction(clockPin, RTC_GPIO_MODE_OUTPUT_ONLY);
-    rtc_gpio_hold_dis(clockPin);
-    rtc_gpio_deinit(clockPin);
-    setSdBusIdlePins();
-}
-
-bool prepareForDeepSleep()
-{
-    // This is deliberately unconditional: it also covers paths where mounting
-    // failed, the clock was invalid, or future code returns before unmounting.
-    releaseSdBus();
-
-    gpio_num_t clockPin = (gpio_num_t)SD_SCLK;
-    gpio_num_t chipSelectPin = (gpio_num_t)SD_CS;
-    esp_err_t result = gpio_set_level(chipSelectPin, 1);
-    if (result == ESP_OK) {
-        result = gpio_set_direction(chipSelectPin, GPIO_MODE_OUTPUT);
-    }
-    if (result == ESP_OK) result = rtc_gpio_hold_dis(clockPin);
-    if (result == ESP_OK) result = rtc_gpio_init(clockPin);
-    if (result == ESP_OK) result = rtc_gpio_pullup_dis(clockPin);
-    if (result == ESP_OK) result = rtc_gpio_pulldown_dis(clockPin);
-    if (result == ESP_OK) result = rtc_gpio_set_level(clockPin, 0);
-    if (result == ESP_OK) {
-        result = rtc_gpio_set_direction(clockPin, RTC_GPIO_MODE_OUTPUT_ONLY);
-    }
-    if (result == ESP_OK) result = rtc_gpio_hold_en(clockPin);
-    if (result == ESP_OK) {
-        // GPIO42 is not RTC-capable. The board's physical pull-up keeps CS
-        // deselected once the host pad becomes high impedance in deep sleep.
-        result = gpio_set_pull_mode(chipSelectPin, GPIO_FLOATING);
-    }
-    if (result == ESP_OK) {
-        result = gpio_set_direction(chipSelectPin, GPIO_MODE_DISABLE);
-    }
-    return result == ESP_OK;
-}
-
 void refresh(const struct tm *now,
              const struct tm *newCleaningTime,
              Cleaner newCleaner)
 {
+    allTimeTotalsValid = false;
     historyValid = initialiseVisibleDays(now);
     if (!historyValid) return;
 
@@ -959,8 +877,8 @@ void refresh(const struct tm *now,
         newCleaningIsValid = false;
     }
 
-    if (mountSdCard()) {
-        // A reset or card removal can leave a partial header or final write.
+    if (mountFlash()) {
+        // A reset or power loss can leave a partial header or final write.
         // Repair it first and force the size-keyed tally cache to rebuild
         // against the repaired file before counting another event.
         Serial.println("Preparing cleaning CSV...");
@@ -984,7 +902,7 @@ void refresh(const struct tm *now,
             } else if (!tallyReady) {
                 Serial.println(
                     "Cleaning logged, but its tally will be rebuilt on the "
-                    "next successful SD read."
+                    "next successful flash read."
                 );
             }
         } else if (newCleaningIsValid && !csvReady) {
@@ -996,8 +914,8 @@ void refresh(const struct tm *now,
 
         Serial.println("Loading recent cleaning history...");
         loadRecentHistoryFromCsv();
-        releaseSdBus();
-        Serial.println("Cleaning history SD session complete.");
+        LittleFS.end();
+        Serial.println("Cleaning history flash session complete.");
     }
 
     retainVisibleHistory();

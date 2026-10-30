@@ -32,7 +32,6 @@ namespace {
 
 volatile uint8_t awakeCleanerMask = CleaningHistory::None;
 bool awakeCleanerCaptureActive = false;
-bool orianaCapturePausedForSd = false;
 bool showMonthlySummary = false;
 portMUX_TYPE awakeCleanerMux = portMUX_INITIALIZER_UNLOCKED;
 
@@ -107,7 +106,6 @@ void beginCapturingAwakeCleanerPresses(uint8_t initialMask)
         attachInterrupt(digitalPinToInterrupt(AppConfig::MatthewButtonPin),
                         captureMatthewPress, FALLING);
         awakeCleanerCaptureActive = true;
-        orianaCapturePausedForSd = false;
     }
 
     // Close the small gap between the initial sample and ISR attachment.
@@ -117,29 +115,6 @@ void beginCapturingAwakeCleanerPresses(uint8_t initialMask)
     }
     if (status & (1ULL << AppConfig::MatthewButtonPin)) {
         mergeAwakeCleanerMask(CleaningHistory::Matthew);
-    }
-}
-
-void pauseOrianaCaptureForSd()
-{
-    if (!awakeCleanerCaptureActive || orianaCapturePausedForSd) return;
-
-    detachInterrupt(digitalPinToInterrupt(AppConfig::OrianaButtonPin));
-    orianaCapturePausedForSd = true;
-}
-
-void resumeOrianaCaptureAfterSd()
-{
-    if (!awakeCleanerCaptureActive || !orianaCapturePausedForSd) return;
-
-    pinMode(AppConfig::OrianaButtonPin, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(AppConfig::OrianaButtonPin),
-                    captureOrianaPress, FALLING);
-    orianaCapturePausedForSd = false;
-
-    // Close the interrupt-detached handoff gap for a press that remains held.
-    if (digitalRead(AppConfig::OrianaButtonPin) == LOW) {
-        mergeAwakeCleanerMask(CleaningHistory::Oriana);
     }
 }
 
@@ -553,16 +528,8 @@ void enterDeepSleep()
         // Clear the complete display power register only once all rendering
         // and last-chance input processing have finished.
         DisplayUi::prepareForDeepSleep();
-        if (!CleaningHistory::prepareForDeepSleep()) {
-            Serial.println(
-                "Failed to retain SD clock LOW; entering deep sleep anyway."
-            );
-            Serial.flush();
-        }
-
-        // SD/display teardown is deliberately last, but it still takes a
-        // finite amount of time. Drain one final button edge before sleeping;
-        // restore the SD clock pad first because recording can mount the card.
+        // Display teardown takes a finite amount of time. Drain one final
+        // button edge before sleeping.
         uint64_t lateButtonStatus = sampleCleanerPins();
         if (lateButtonStatus &
             (1ULL << AppConfig::OrianaButtonPin)) {
@@ -574,14 +541,12 @@ void enterDeepSleep()
         }
         uint8_t lateCleanerMask = consumeAwakeCleanerMask();
         if (lateCleanerMask != CleaningHistory::None) {
-            CleaningHistory::beginWakeCycle();
             recordCleanerMask(lateCleanerMask);
             continue;
         }
 
         if (useRtcAlarmWake &&
             digitalRead(AppConfig::RtcIrqPin) == LOW) {
-            CleaningHistory::beginWakeCycle();
             Serial.println(
                 "RTC IRQ asserted during final teardown; servicing it awake."
             );
@@ -718,7 +683,6 @@ void setup()
 
     Serial.begin(115200);
     ClockService::configureLocalTimezone();
-    CleaningHistory::beginWakeCycle();
     configureWakePins();
 
     // Capture wake information before display/RTC initialisation so a cleaner
@@ -728,10 +692,6 @@ void setup()
     beginCapturingAwakeCleanerPresses(static_cast<uint8_t>(
         determineCleaner(wakeSources.ext1Status)
     ));
-    CleaningHistory::setSdAccessHooks(
-        pauseOrianaCaptureForSd,
-        resumeOrianaCaptureAfterSd
-    );
 
     delay(200);
 
