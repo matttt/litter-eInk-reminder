@@ -3,12 +3,14 @@
 #include <Arduino.h>
 #include <esp_adc_cal.h>
 #include <esp_heap_caps.h>
+#include <esp_system.h>
 #include <math.h>
 
 #include "app_config.h"
 #include "cleanImage.h"
 #include "cleaning_history.h"
 #include "dirtyImage.h"
+#include "display_refresh.h"
 #include "epd_driver.h"
 #include "opensans12b.h"
 #include "opensans24b.h"
@@ -21,6 +23,9 @@ enum DisplayMode { DisplayDirty, DisplayClean };
 uint8_t *framebuffer = nullptr;
 int adcVref = 1100;
 DisplayMode currentMode = DisplayDirty;
+RTC_DATA_ATTR DisplayRefresh::Snapshot renderedFrame = {};
+static_assert(EPD_WIDTH == DisplayRefresh::Width &&
+              EPD_HEIGHT == DisplayRefresh::Height, "Refresh geometry mismatch");
 
 void claimEpdConfigPin()
 {
@@ -411,15 +416,65 @@ void copySelectedImageToFramebuffer(const DisplayUi::State &state)
 void refreshDisplay(const DisplayUi::State &state)
 {
     copySelectedImageToFramebuffer(state);
+    DisplayRefresh::Plan update = DisplayRefresh::plan(
+        framebuffer, currentMode == DisplayClean, renderedFrame
+    );
+    if (!update.full && update.regionCount == 0) {
+        Serial.println("EPD unchanged; skipping refresh.");
+        return;
+    }
+
+    // The driver needs a tightly packed image for each rectangle. Reuse one
+    // scratch buffer sized for the largest region, and fall back on allocation
+    // failure so the display still receives the requested state.
+    uint8_t *regionBuffer = nullptr;
+    if (!update.full) {
+        size_t largest = 0;
+        for (size_t i = 0; i < update.regionCount; ++i) {
+            const auto &region = update.regions[i];
+            size_t bytes = region.width * region.height / 2;
+            if (bytes > largest) largest = bytes;
+        }
+        regionBuffer = (uint8_t *)heap_caps_malloc(largest, MALLOC_CAP_SPIRAM);
+        if (!regionBuffer) {
+            Serial.println("Partial-refresh allocation failed; using full refresh.");
+            // An empty snapshot requests a full refresh and resets its counter.
+            update = DisplayRefresh::plan(
+                framebuffer, currentMode == DisplayClean, {}
+            );
+        }
+    }
+
+    // An interrupted refresh leaves unknown physical pixels. Do not reuse its
+    // fingerprints unless every clear/draw and poweroff completed.
+    renderedFrame.magic = 0;
     claimEpdConfigPin();
     epd_poweron();
-    epd_clear();
-    yield();
     uint32_t start = millis();
-    epd_draw_grayscale_image(epd_full_screen(), framebuffer);
+    if (update.full) {
+        Serial.println("EPD full refresh.");
+        epd_clear();
+        yield();
+        epd_draw_grayscale_image(epd_full_screen(), framebuffer);
+    } else {
+        Serial.printf("EPD partial refresh: %u region(s).\n",
+                      static_cast<unsigned>(update.regionCount));
+        for (size_t i = 0; i < update.regionCount; ++i) {
+            const auto &region = update.regions[i];
+            Rect_t area = {region.x, region.y, region.width, region.height};
+            DisplayRefresh::copyRegion(framebuffer, region, regionBuffer);
+            // Grayscale drawing assumes white pixels. Erase the old text in
+            // this region first, then redraw the complete composite beneath it.
+            epd_clear_area(area);
+            yield();
+            epd_draw_grayscale_image(area, regionBuffer);
+        }
+    }
     Serial.printf("EPD draw took %lums\r\n", millis() - start);
     epd_poweroff();
     releaseEpdConfigPin();
+    free(regionBuffer);
+    renderedFrame = update.next;
     yield();
 }
 
@@ -429,6 +484,9 @@ namespace DisplayUi {
 
 bool initialise()
 {
+    // RTC state is only a description of known panel pixels after deep sleep.
+    // Resets, firmware uploads, and power loss always repaint the whole screen.
+    if (esp_reset_reason() != ESP_RST_DEEPSLEEP) renderedFrame = {};
     epd_init();
     framebuffer = (uint8_t *)heap_caps_malloc(
         EPD_WIDTH * EPD_HEIGHT / 2, MALLOC_CAP_SPIRAM

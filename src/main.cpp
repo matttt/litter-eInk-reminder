@@ -19,6 +19,7 @@
 #include "cleaning_history.h"
 #include "clock_service.h"
 #include "display_ui.h"
+#include "last_clean_state.h"
 #include "esp32s3/rom/rtc.h"
 
 // These values persist across deep-sleep cycles in RTC slow memory.
@@ -26,7 +27,7 @@ RTC_DATA_ATTR uint32_t alarmWakeCount = 0;
 RTC_DATA_ATTR bool rtcCleanTimestampValid = false;
 RTC_DATA_ATTR bool rtcReminderOverdue = false;
 RTC_DATA_ATTR uint8_t rtcPendingCleanerMask = CleaningHistory::None;
-RTC_DATA_ATTR struct tm rtcLastCleanTime = {0};
+RTC_DATA_ATTR struct tm rtcLastCleanTime = {};
 
 namespace {
 
@@ -297,6 +298,17 @@ void applyScheduledEvents(ClockService::ScheduledEventMask events,
     if (now) refreshCleaningHistory(now);
 }
 
+void persistLastCleanState()
+{
+    LastCleanState::State state = {};
+    state.timestampValid = rtcCleanTimestampValid;
+    state.lastCleanTime = rtcLastCleanTime;
+    state.pendingCleanerMask = rtcPendingCleanerMask;
+    if (!LastCleanState::save(state)) {
+        Serial.println("Failed to save last-clean state to NVS; RTC copy only.");
+    }
+}
+
 void recordCleanerMask(uint8_t cleanerMask)
 {
     cleanerMask &= static_cast<uint8_t>(CleaningHistory::Both);
@@ -322,10 +334,13 @@ void recordCleanerMask(uint8_t cleanerMask)
 
         rtcPendingCleanerMask = CleaningHistory::None;
         rtcLastCleanTime = now;
+        // Commit before CSV work and the display's power-on current spike.
+        persistLastCleanState();
         refreshCleaningHistory(&now, &now, cleaner);
         ClockService::scheduleCleaningReminder24HoursAfter(&now);
     } else {
         rtcPendingCleanerMask |= cleanerMask;
+        persistLastCleanState();
     }
 
     DisplayUi::showClean(displayState());
@@ -628,26 +643,32 @@ void handleClockRecoveryWake(const WakeSources &sources)
     );
     beginCapturingAwakeCleanerPresses(initialCleanerMask);
     ClockService::syncFromNtp();
-    rtcPendingCleanerMask |=
+    uint8_t capturedCleanerMask =
         consumeAwakeCleanerMask() &
         static_cast<uint8_t>(CleaningHistory::Both);
 
     struct tm now;
     if (!ClockService::getLocalTime(&now)) {
-        if (rtcPendingCleanerMask != CleaningHistory::None) {
-            rtcCleanTimestampValid = false;
-            rtcReminderOverdue = false;
+        if (capturedCleanerMask != CleaningHistory::None) {
+            recordCleanerMask(capturedCleanerMask);
+        } else if (rtcPendingCleanerMask != CleaningHistory::None) {
             DisplayUi::showClean(displayState());
         }
         Serial.println("External clock is still invalid; will retry later.");
         return;
     }
 
-    if (rtcPendingCleanerMask != CleaningHistory::None) {
-        recordCleanerMask(rtcPendingCleanerMask);
+    if ((rtcPendingCleanerMask | capturedCleanerMask) != CleaningHistory::None) {
+        recordCleanerMask(rtcPendingCleanerMask | capturedCleanerMask);
         return;
     }
 
+    // A cold boot may have restored the timestamp while the clock was invalid.
+    // Rebuild from that original time once it is available, even if overdue.
+    if (rtcCleanTimestampValid) {
+        rtcReminderOverdue = false;
+        ClockService::scheduleCleaningReminder24HoursAfter(&rtcLastCleanTime);
+    }
     ClockService::ScheduledEventMask events =
         serviceScheduledEventsAndRefreshTime(&now);
     applyScheduledEvents(events, &now);
@@ -657,21 +678,39 @@ void handleClockRecoveryWake(const WakeSources &sources)
 void handleColdBoot()
 {
     Serial.println("Cold boot / reset");
-    ClockService::syncFromNtp();
     alarmWakeCount = 0;
     rtcCleanTimestampValid = false;
     rtcReminderOverdue = false;
     rtcPendingCleanerMask = CleaningHistory::None;
     rtcLastCleanTime = {};
 
+    LastCleanState::State saved = {};
+    if (LastCleanState::load(&saved)) {
+        rtcCleanTimestampValid = saved.timestampValid;
+        rtcLastCleanTime = saved.lastCleanTime;
+        rtcPendingCleanerMask = saved.pendingCleanerMask;
+        Serial.println("Restored last-clean state from NVS.");
+    }
+    ClockService::syncFromNtp();
+
     struct tm now;
     if (ClockService::getLocalTime(&now)) {
-        refreshCleaningHistory(&now);
         ClockService::resetScheduledEvents(&now);
+        if (rtcPendingCleanerMask != CleaningHistory::None) {
+            recordCleanerMask(rtcPendingCleanerMask);
+            return;
+        }
+        if (rtcCleanTimestampValid) {
+            ClockService::scheduleCleaningReminder24HoursAfter(&rtcLastCleanTime);
+        }
+        applyScheduledEvents(serviceScheduledEventsAndRefreshTime(&now), &now);
     } else {
         ClockService::resetScheduledEvents();
+        // Retain the saved timestamp, but do not claim it is still within 24
+        // hours until the clock recovers. An undated pending press stays clean.
+        rtcReminderOverdue = rtcCleanTimestampValid;
     }
-    DisplayUi::showDirty(displayState());
+    renderCurrentState();
 }
 
 }  // namespace

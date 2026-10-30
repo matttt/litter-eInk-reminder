@@ -28,7 +28,9 @@ The firmware source is split by responsibility:
 | `main.cpp` | Wake handling, deep-sleep state, and application flow |
 | `clock_service.*` | PCF8563 RTC, NTP sync, and midnight/reminder scheduling |
 | `cleaning_history.*` | RTC history cache, LittleFS CSV log, and all-time tally |
+| `last_clean_state.*` | NVS flash persistence for the last cleaning and undated button presses |
 | `display_ui.*` | E-paper rendering, history panel, monthly pie chart, and battery warning |
+| `display_refresh.*` | Changed-region detection and packed partial-refresh images |
 | `app_config.h` | Pins, network settings, time zone, and application constants |
 
 Build the firmware:
@@ -43,10 +45,15 @@ Run the host storage regression tests (requires a C++11 compiler):
 sh tests/host/run.sh
 ```
 
-These compile the production history module against fake flash/file APIs and
+These compile the production storage modules against fake flash/file APIs and
 cover first-use formatting, recovery after reset, tally rebuilding, read-only
-refreshes, and mount/write failures. They do not simulate LittleFS internals or
+refreshes, last-clean restoration (including DST), pending cleaner presses,
+invalid stored records, and mount/write failures. They do not simulate flash internals or
 measure hardware power consumption.
+
+Display tests cover changed-region selection, image packing, erased text,
+clean/dirty transitions, invalid retained state, and periodic full refreshes.
+They do not simulate the panel waveform or measure ghosting on hardware.
 
 Connect the board's USB-C port and upload it:
 
@@ -94,6 +101,38 @@ The right side of the display shows `Today` and the previous six calendar days.
 At midnight the rows advance, the previous `Today` row receives its weekday
 label, and a blank `Today` row appears at the top. `M` means Matthew, `O` means
 Oriana, and `MO` means both people recorded a cleaning that day.
+
+When the screen is already clean, the firmware compares fingerprints of
+120 x 90 pixel tiles against the last completed render. Only changed tiles are
+cleared and redrawn; adjacent tiles are combined into rectangles. The timestamp,
+history, statistics, and battery warning can update without flashing the whole
+screen. If nothing visible changed, the display stays powered off. Changed
+regions still flash locally because the grayscale driver requires a white base
+before drawing replacement pixels.
+
+The small render cache lives in RTC memory across deep sleep. Cold boots,
+resets, unknown/interrupted renders, and clean/dirty transitions use a full
+refresh. After 16 partial refreshes, the next visible change also triggers a
+full refresh to limit ghosting. No display fingerprints are written to flash.
+
+The last-cleaned timestamp is committed separately to the ESP32's NVS flash
+partition before CSV logging and display refresh. Deep-sleep wakes use the RTC
+memory copy; cold boots and resets restore the NVS copy and rebuild the reminder
+from the original cleaning time. A reset does not restart the 24-hour window:
+an expired reminder immediately shows dirty. Routine wakes and restores do not
+write this NVS record, and identical updates are skipped.
+
+If a cleaning is recorded while the clock is invalid, NVS stores the pending
+cleaner mask. Once time recovers, the firmware timestamps that cleaning at
+recovery time, as it does during normal clock recovery. A saved timestamp is
+retained if the clock is unavailable at boot, but the display stays dirty until
+its age can be checked. A pending undated cleaning continues to show clean.
+
+Persistence starts with the first cleaning recorded by this firmware; older CSV
+rows are not imported into the NVS state. An NVS save failure is logged and the
+live state continues in RTC memory. A power interruption during a write may lose
+the newest update. Normal firmware uploads preserve NVS; a full flash erase
+clears it. NVS state is independent of LittleFS history and its tally.
 
 The seven-day window is cached with a checksum in ESP32 RTC slow memory for fast
 deep-sleep continuity and reconstructed from the internal flash log after a power loss or
